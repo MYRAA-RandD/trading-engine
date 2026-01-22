@@ -49,9 +49,19 @@ ET = pytz.timezone("America/New_York")
 MARKET_OPEN_ET = time(9, 30)
 MARKET_CLOSE_ET = time(16, 0)
 
-START_TRADING_ET = time(9, 35)
-STOP_NEW_TRADES_ET = time(10, 30)
+# =========================================================
+# Time (Eastern)
+# =========================================================
+ET = pytz.timezone("America/New_York")
 
+MARKET_OPEN_ET = time(9, 30)
+START_TRADING_ET = time(10, 0)      # trading allowed
+WARMUP_END_ET = START_TRADING_ET    # read-only until trading start
+STOP_NEW_TRADES_ET = time(11, 30)
+MARKET_CLOSE_ET = time(16, 0)
+
+COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "30"))
+LOOP_SLEEP_SECONDS = int(os.getenv("LOOP_SLEEP_SECONDS", "20"))
 COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "30"))
 LOOP_SLEEP_SECONDS = int(os.getenv("LOOP_SLEEP_SECONDS", "20"))
 
@@ -114,7 +124,7 @@ SHADOW_LOG_PATH = BASE_DIR / "shadow_log_v2.csv"
 # =============================
 # ROBUSTNESS / DIAGNOSTICS
 # =============================
-RUN_MANIFEST_PATH = BASE_DIR / "run_manifest_v2_2.json"
+RUN_MANIFEST_PATH = BASE_DIR / "run_manifest_v2_3.json"
 HEARTBEAT_SECONDS = int(os.getenv("HEARTBEAT_SECONDS", "180"))
 RETRY_ATTEMPTS = int(os.getenv("RETRY_ATTEMPTS", "3"))
 RETRY_SLEEP_SECONDS = float(os.getenv("RETRY_SLEEP_SECONDS", "0.6"))
@@ -243,7 +253,7 @@ def write_run_manifest(script_path: Path) -> None:
 def banner_startup(script_path: Path) -> None:
     """Console banner (no trade logic change)."""
     print("\n" + "=" * 72)
-    print("\U0001F9E0  MYRAA V2.2 — PAPER RUN START")
+    print("\U0001F9E0  MYRAA V2.3 BASELINE — PAPER RUN START")
     print(f"FILE   : {script_path.resolve()}")
     print(f"SHA256 : {file_sha256_short(script_path, 16)}   GIT: {safe_git_head()}")
     print(f"FEED   : {DATA_FEED}   PAPER={ALPACA_PAPER}")
@@ -896,24 +906,85 @@ class TradeTracker:
                 tr.min_price_seen = px
 
     def finalize_exits(self, trading: TradingClient, session_date: str) -> None:
-        try:
-            positions = {p.symbol: p for p in trading.get_all_positions()}
-        except Exception:
-            return
+        """Reconcile exits with broker fills and derive consistent exit labeling."""
 
-        still_open = set(positions.keys())
-        to_close = [sym for sym in list(self.open_trades.keys()) if sym not in still_open]
+        def _order_attr(o, name, default=None):
+            try:
+                if isinstance(o, dict):
+                    return o.get(name, default)
+            except Exception:
+                pass
+            return getattr(o, name, default)
+
+        def _as_float(x):
+            try:
+                return float(x)
+            except Exception:
+                return None
+
+        def _best_exit_order(trade):
+            want_side = "sell" if trade.side.upper() == "BUY" else "buy"
+            entry_ts = trade.entry_time
+            candidates = []
+
+            for o in closed_orders:
+                try:
+                    if _order_attr(o, "symbol") != trade.symbol:
+                        continue
+                    if str(_order_attr(o, "side", "")).lower() != want_side:
+                        continue
+                    filled_at = _order_attr(o, "filled_at")
+                    if not filled_at:
+                        continue
+                    try:
+                        filled_at_et = filled_at.astimezone(ET)
+                    except Exception:
+                        filled_at_et = filled_at
+                    if filled_at_et < (entry_ts - timedelta(seconds=5)):
+                        continue
+                    fq = _as_float(_order_attr(o, "filled_qty"))
+                    if fq is not None and abs(fq - float(trade.qty)) > 1e-6:
+                        continue
+                    candidates.append((filled_at_et, o))
+                except Exception:
+                    continue
+
+            if not candidates:
+                return None
+            candidates.sort(key=lambda t: t[0])
+            return candidates[0]
+
+        try:
+            closed_orders = trading.get_orders(status="closed", limit=500)
+        except Exception:
+            closed_orders = []
+
+        to_close = list(self.open_trades.keys())
 
         for sym in to_close:
             tr = self.open_trades.get(sym)
             if not tr:
                 continue
 
-            tr.exit_time = now_et()
+            tr.exit_time = tr.exit_time or now_et()
+            tr.exit_price = tr.exit_price or tr.entry_price
+            exit_order = None
 
-            # best-effort exit price (if unknown, use entry)
-            if tr.exit_price is None:
-                tr.exit_price = tr.entry_price
+            found = _best_exit_order(tr)
+            if found:
+                exit_time_et, o = found
+                exit_order = o
+                tr.exit_time = exit_time_et
+                px = None
+                for fld in ("filled_avg_price", "avg_fill_price"):
+                    if px is None:
+                        px = _as_float(_order_attr(o, fld))
+                if px is None:
+                    px = _as_float(_order_attr(o, "limit_price"))
+                if px is None:
+                    px = _as_float(_order_attr(o, "stop_price"))
+                if px is not None:
+                    tr.exit_price = px
 
             if tr.exit_price >= tr.tp_price:
                 tr.exit_reason = "TP"
@@ -922,12 +993,10 @@ class TradeTracker:
                 tr.exit_reason = "SL"
                 tr.outcome = "LOSS"
             else:
-                tr.exit_reason = "Unknown"
-                tr.outcome = "Unknown"
+                tr.exit_reason = tr.exit_reason or "EXIT"
+                tr.outcome = tr.outcome or "FLAT"
 
-            rm = tr.r_multiple()
-            tr.exit_quality = exit_quality_tag(tr.exit_reason, rm)
-
+            tr.exit_quality = exit_quality_tag(tr.exit_reason, tr.r_multiple())
             self._write_attribution_row(tr, session_date=session_date)
             del self.open_trades[sym]
 
@@ -1054,13 +1123,12 @@ def main() -> None:
                 time_mod.sleep(30)
                 continue
 
-            # entry delay
-            if now_et().time() < START_TRADING_ET:
-                log_decision("SYSTEM", "SKIP", "entry_delay", note="waiting_for_start")
-                time_mod.sleep(20)
-                continue
+            now_t = now_et().time()
 
-            allow_new_entries = now_et().time() < STOP_NEW_TRADES_ET
+            # Trading is disabled during warmup (read-only) and after cutoff, but we still
+            # run the full data + filters stack so logs remain counterfactual-ready.
+            allow_new_entries = (now_t >= START_TRADING_ET) and (now_t < STOP_NEW_TRADES_ET)
+            trading_disabled = not allow_new_entries
 
             # account snapshot
             acct = trading.get_account()
@@ -1082,11 +1150,15 @@ def main() -> None:
                 time_mod.sleep(60)
                 continue
 
+            # In V2.3 we keep processing during warmup / after-cutoff (read-only mode)
+            # so filters, candidate scoring, and shadow logs still populate.
+            trading_disabled = False
             if not allow_new_entries:
-                log_decision("SYSTEM", "SKIP", "after_cutoff", note="no_new_entries_after_cutoff", equity=equity_now)
-                log_blocked_by("after_cutoff", data, symbols, spy_last=0.0, spy_vwap=0.0, equity=equity_now, realized_today=realized_today, trades_today=trades_today, vol_flag=(SESSION.get("first30_vol_flag") or "NORMAL"), note="system_block")
-                time_mod.sleep(60)
-                continue
+                trading_disabled = True
+                block_reason = "warmup_read_only" if now_t < START_TRADING_ET else "after_cutoff"
+                note = "warming_up_no_trades" if block_reason == "warmup_read_only" else "no_new_entries_after_cutoff"
+                log_decision("SYSTEM", "SKIP", block_reason, note=note, equity=equity_now)
+                log_blocked_by(block_reason, data, symbols, spy_last=0.0, spy_vwap=0.0, equity=equity_now, realized_today=realized_today, trades_today=trades_today, vol_flag=(SESSION.get("first30_vol_flag") or "NORMAL"), note="system_block")
 
             # lock first30 vol flag once
             if SESSION.get("first30_vol_flag") is None:
@@ -1294,6 +1366,33 @@ def main() -> None:
                     qty = MIN_QTY
                 if qty > MAX_QTY:
                     qty = MAX_QTY
+
+                # Read-only mode (warmup) or after-cutoff: log what WOULD have been submitted,
+                # but do not change behavior by placing orders.
+                if trading_disabled:
+                    block_reason = "warmup_read_only" if now_t < START_TRADING_ET else "after_cutoff"
+                    tb = time_bucket_label(now_et())
+                    log_shadow(
+                        sym,
+                        shadow_type="WOULD_TRADE",
+                        blocked_by=block_reason,
+                        decision="TRADE",
+                        reason="submit_order",
+                        entry=entry_price, stop=stop_price, tp=tp_price,
+                        bid=bid, ask=ask, atr=atr_val,
+                        atr_pct=atr_pct, atr_regime=atr_regime,
+                        qty=qty,
+                        realized_today=realized_today,
+                        trades_today=trades_today,
+                        equity=equity_now,
+                        spy=spy_last,
+                        vwap=spy_vwap,
+                        vol_flag=vol_flag,
+                        time_bucket=tb,
+                        note="trade_blocked_read_only",
+                    )
+                    log_decision(sym, "SKIP", block_reason, equity=equity_now, vol_flag=vol_flag, note="trade_blocked_read_only")
+                    continue
 
                 order = MarketOrderRequest(
                     symbol=sym,
